@@ -1,0 +1,201 @@
+--===========================================================================================================================================================
+-- Шаг 1 - Собираю датасет из ADWH по комментариям для дальнейшей аналитики
+--===========================================================================================================================================================
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.1 Отбираю пул комментариев адресованых менеджерам. Комментарии имеют структурированную информацию о спичах и методологиях для продаж
+
+-- Фильтрую комментарии: 
+---- по идентификатору пользователя - выбираю Маркетинг, 
+---- выбираю не технический комментарий, 
+---- выбираю только структурированные комментарии (по ContractVersion)
+---- выбираю период создания комментария с февраля по апрель 2024
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- про поле CreatedBy, идентификатор пользователя = Маркетинг
+select * from [Sales].[db].[User]  where Id = '11A11111-2111-4111-1111-1111111111' -- маркетинг
+
+drop table if exists #datalen1;
+select ActivityId
+     , Id                       as MessageID
+     , len(Data)                as datalen
+     , cast(DateCreate as date) as DateCreate
+into   #datalen1
+from   [SalesS].[db].[ActMess]
+where  1 = 1
+       and Technical = '0' -- Не технический комментарий
+       and CreatedBy = '11A11111-2111-4111-1111-1111111111' -- User_id = Маркетинг
+       and ContractVersion = '1'
+       and cast(DateCreate as date) between '2024-04-18' and '2024-06-17';
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.2.1 Добавляю предложения к комментариям через карточки
+-- К комментариям добавляю информацию по юзерам карточки (менеджеры продаж) 
+-- Фильтрую по a.SourceTypeId = '177'- "Загружено извне"
+-- Выявляю предложения, которые относятся к комментарию в диапазоне +- 1 день - маркирую 1/0
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists #datalen2;
+
+select    d.ActivityId
+        , cast(a.DateCreate as date)                                                                                                       as date_activity
+        , d.MessageID
+        , d.DateCreate                                                                                                                     as date_comment
+        , d.datalen
+        , o.Id                                                                                                                             as offerId
+        , ot.Name                                                                                                                          as offer_type
+        , cast(o.DateCreate as date)                                                                                                       as date_offer
+        , p.Name                                                                                                                           as ProductName
+        , iif(d.DateCreate between dateadd(d, -1, o.DateCreate) and dateadd(d, 1, o.DateCreate), 1, 0)                                     as datecheck1                                 -- если 0, то оффер не в диапазоне +- 1 день от сообщения
+        , iif(d.DateCreate between dateadd(d, -3, o.DateCreate) and dateadd(d, 3, o.DateCreate), 1, 0)                                     as datecheck3                                 -- Беру период +- 3 дня
+        , iif(d.DateCreate between dateadd(d, -7, o.DateCreate) and dateadd(d, 7, o.DateCreate), 1, 0)                                     as datecheck7                                 -- Беру период +- 7 дней
+        , iif(d.DateCreate between dateadd(d, -14, o.DateCreate) and dateadd(d, 14, o.DateCreate), 1, 0)                                   as datecheck14                              -- Беру период +- 14 дней
+        , iif((cast(a.DateCreate as date) = cast(d.DateCreate as date) and cast(d.DateCreate as date) = cast(o.DateCreate as date)), 1, 0) as OneDay -- 'оффер, коммент, карточка - в один день'
+        , iif(
+            (cast(a.DateCreate as date) = cast(d.DateCreate as date)
+             and cast(d.DateCreate as date) = cast(o.DateCreate as date))
+          , 'оффер, коммент, карточка - в один день'
+          , iif((cast(d.DateCreate as date) < cast(o.DateCreate as date)), 'оффер после коммента', 'оффер до коммента'))                   as datemark
+into      #datalen2
+from      #datalen1                      as d
+left join [SalesS].[db].[Act]  as a on d.ActivityId = a.Id
+left join [SalesS].[db].[Offer]     as o on d.ActivityId = o.ActivityId
+left join [SalesS].[db].[OfferType] as ot on o.TypeId = ot.Id
+left join [SalesS].[db].[User]      as u on a.OwnerId = u.Id
+left join [SalesS].[db].[Prod]   as p on o.ProductId = p.Id
+where     1 = 1
+          and a.SourceTypeId = '177'; --"Загружено извне" 
+
+select * from #datalen2 where ActivityId='777AC777-6277-7777-A2C1-F55DA2777'
+-- идентификатор "Загружено извне" 		  
+ select distinct st.Id, st.Description from [SalesS].[db].[SourceType] st where Id = '177'
+
+ -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.2.2 Связываю комментарии и офферы хронологически. Включаю все прошлые офферы (до времени загрузки прошлого комментария)"
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Создаю лаг на уровне карточки
+drop table if exists #lag;
+with tab as (select distinct ActivityId, cast(date_comment as date) as date_comment from #datalen2)
+select 
+  ActivityId
+, date_comment
+, lag(date_comment) over (partition by ActivityId order by date_comment asc) as lastMessageDate into #lag from tab;
+
+-- Подтягиваю колонку с лагом к времянке datalen2
+alter table #datalen2 add lagMark int;
+
+update    #datalen2
+set       lagMark = iif(cast(d.date_offer as date) = cast(d.date_comment as date)
+                      , 1
+                      , iif(d.date_offer < d.date_comment and d.date_offer >= isnull(l.lastMessageDate, d.date_activity), 1, 0)) -- "включить все прошлые офферы (до времени загрузки прошлого комментария)"
+from      #datalen2 as d
+left join #lag      as l on d.ActivityId = l.ActivityId
+                            and d.date_comment = l.date_comment;
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.2.3 Собираю маркировку по сообщениям в рамках карточки
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists #uniq_message;
+
+select distinct 
+   ActivityId
+ , COALESCE(count( distinct MessageID), 0) as uniq_message
+ into #uniq_message
+ from #datalen2
+group by 
+    ActivityId
+having count(distinct MessageID) = 1
+
+-- Подтягиваю колонку с маркировкой по уникальности сообщения в карточке
+alter table #datalen2  drop column mark_message
+alter table #datalen2 add mark_message int
+
+update #datalen2 
+set mark_message = u.uniq_message
+from #uniq_message as u 
+where #datalen2.ActivityId = u.ActivityId
+
+update #datalen2 
+set mark_message = '0' where mark_message is null
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.2.4 Собираю маркировку по продуктам в рамках карточки
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists #uniq_prod;
+
+ with tab as (
+   select distinct 
+   ActivityId
+ , coalesce(count(distinct ProductName), 0) as uniq_ProductName 
+ from #datalen2
+group by 
+    ActivityId
+having count(distinct ProductName) = 1
+)
+SELECT 
+tab.ActivityId
+, u.ProductName
+into #uniq_prod
+from tab
+left join (SELECT distinct ActivityId, ProductName FROM #datalen2 where ActivityId in (select ActivityId from tab)) as u on tab.ActivityId = u.ActivityId
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.2.5 Собираю маркировку по типам офферов в рамках карточки
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists #uniq_offer_type;
+
+ with tab as (
+   select distinct 
+   ActivityId
+ , COALESCE(count( distinct offer_type), 0) as uniq_offer_type -- ноль когда к карточке не подтянулся оффер и следовательно нет типа оффера
+ from #datalen2
+group by 
+    ActivityId
+having count(distinct offer_type) = 1
+)
+SELECT 
+tab.*
+, u.offer_type
+into #uniq_offer_type
+from tab
+left join (SELECT distinct ActivityId, offer_type FROM #datalen2 where ActivityId in (select ActivityId from tab where tab.uniq_offer_type ='1')) as u on tab.ActivityId = u.ActivityId
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.3 Собираю итоговую таблицу для аналитики
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists [User].[a.tarbeev].[final_table1];
+select    d.ActivityId
+        , d.date_activity
+        , d.MessageID
+        , d.date_comment
+		, d.mark_message
+        , d.datalen
+, case
+         when d.datalen < '500' then '500'
+         when d.datalen < '1000' then '1000'
+         when d.datalen < '1500' then '1500'
+         when d.datalen < '2000' then '2000'
+		 when d.datalen < '2000' then '2500'
+         when d.datalen < '3000' then '3000'
+         when d.datalen < '6000' then '6000'
+         when d.datalen < '10000' then '10000'
+         when d.datalen < '20000' then '20000'
+         else 'over 20k'
+       end as datalengroup
+        , count(offerId)  as cnt_offerId
+        , sum(OneDay)     as OneDay
+        , sum(datecheck1) as datecheck1
+        , sum(datecheck3) as datecheck3
+        , sum(datecheck7) as datecheck7
+		, sum(datecheck14) as datecheck14
+        , sum(lagMark)    as lagMark
+        , isnull(up.ProductName, 0) as uniq_product
+        , isnull(uot.offer_type, 0) as uniq_offer_type
+into      [User].[a.tarbeev].[final_table1]
+from      #datalen2 as d
+left join #uniq_prod       up on up.ActivityId = d.ActivityId
+left join #uniq_offer_type uot on uot.ActivityId = d.ActivityId
+group by  d.ActivityId
+        , d.date_activity
+        , d.MessageID
+        , d.date_comment
+		, d.mark_message
+        , d.datalen
+        , isnull(up.ProductName, 0)
+        , isnull(uot.offer_type, 0);
