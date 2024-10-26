@@ -1,0 +1,166 @@
+--===========================================================================================================================================================
+-- Шаг 1 - Выгружаю метрики для комментариев из ClickHouse в SQL
+--===========================================================================================================================================================
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.1 Тяну данные из ClickHouse по метрике "Движение мышкой внутри комментария"
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists #mouse
+
+create table #mouse (messageId uniqueidentifier, cnt_mouse int)
+
+insert #mouse
+exec [Metriks].[db].[CH_query]
+'
+select
+    visitParamExtractString (CustomVariables, ''messageId'') as messageId,
+    count(*) as cnt
+from
+    metriks.track
+where
+    SiteId = 189 -- КП
+    and EventDate   between ''2024-04-18'' and ''2024-07-20''               
+    and Category = ''ActEvent''
+    and Action = ''MouseMes''
+group by
+    messageId
+'
+select top 1000 * from #mouse
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.2 Тяну данные из ClickHouse по метрикам "Выделение текста" и "Копирование текста"
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+drop table if exists #ctrlC_SelectText
+create table #ctrlC_SelectText (messageId uniqueidentifier, cnt_selectText int, cnt_ctrlC int)
+
+insert #ctrlC_SelectText
+exec [Metriks].[db].[CH_query]
+'
+select
+    REPLACE(messageIds, ''"'', '''') AS messageId
+    , countIf(Action = ''ctrl+c'') as ctrlC
+    , countIf(Action = ''selectText'') as selectText
+from
+    metriks.track
+ARRAY JOIN JSONExtractArrayRaw(CustomVariables, ''messageIds'') as messageIds
+where
+SiteId = 189 -- КП
+    and EventDate   between ''2024-04-18'' and ''2024-07-20''
+    and Category = ''ActEvent''
+    and Action in (''ctrl+c'', ''selectText'')
+group by
+    messageId
+'
+
+select * from #ctrlC_SelectText
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.3 Тяну данные из ClickHouse по метрике "Разворачивание" и "Сворачивание" комментариев 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+drop table if exists [User].[a.tarbeev].[collapse_expand]
+
+create table #collapse (activityId uniqueidentifier, Date_expand_collapse date, cnt_expand int, cnt_collapse int)
+
+insert  #collapse
+exec [Metriks].[db].[CH_query] 
+'
+select 
+      visitParamExtractString (CustomVariables, ''activityId'') as activityId
+    , EventDate as Date_expand_collapse
+    , countIf(Action = ''expand'') as cnt_expand
+    , countIf(Action = ''collapse'') as cnt_collapse
+from 
+    metriks.track 
+where
+SiteId = 189 -- КП
+    and EventDate   between ''2024-04-18'' and ''2024-07-20''
+    and Category = ''ActEvent''
+    and Action in (''expand'', ''collapse'')
+group by
+    activityId,
+    Date_expand_collapse
+'
+
+--===========================================================================================================================================================
+-- Шаг 2 - Собираю датасеты из полученных данных 
+--===========================================================================================================================================================
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 2.1 -- Создаю lead на уровне даты сообщения, нужен для того, 
+-- чтобы связать метрики "Разворачивание" и "Сворачивание" по временному промежутку от даты создания коммента до даты создания следующего
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 
+drop table if exists #lead;
+with tab as (select distinct ActivityId, date_activity, date_comment  from [User].[a.tarbeev].[final_table1])
+select ActivityId
+	 , date_activity
+     , date_comment
+     , isnull(lead(date_comment) over (partition by ActivityId order by date_comment asc), getdate()) as lead_message
+into   #lead
+from   tab;
+
+select top 1000 * from #lead order by ActivityId,date_comment
+
+alter table [User].[a.tarbeev].[final_table1]  drop column leadMessage;
+
+alter table [User].[a.tarbeev].[final_table1] add leadMessage date;
+
+update [User].[a.tarbeev].[final_table1] 
+set 
+leadMessage = l.lead_message
+from [User].[a.tarbeev].[final_table1] as d 
+left join #lead as l on d.ActivityId = l.ActivityId
+         and d.date_comment = l.date_comment
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 2.1 Собираю полученные данные в финальный датасет
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+drop table if exists [User].[a.tarbeev].[Final_metrics1];
+select
+f.ActivityId
+, f.date_activity
+, f.MessageID
+, f.date_comment
+, f.mark_message
+, f.datalen
+, f.datalengroup
+, f.OneDay
+, f.datecheck1
+, f.datecheck3
+, f.datecheck7
+, f.datecheck14
+, f.lagMark
+, f.uniq_offer_type
+, f.uniq_product
+, coalesce(m.cnt_mouse, 0) as cnt_mouse
+, coalesce(cs.cnt_selectText, 0) as cnt_selectText
+, coalesce(cs.cnt_ctrlC, 0) as cnt_ctrlC
+, coalesce(sum(c.cnt_expand), 0) as cnt_expand
+, coalesce(sum(c.cnt_collapse), 0) as cnt_collapse
+into
+    [User].[a.tarbeev].[Final_metrics1]
+from
+    [User].[a.tarbeev].[final_table1] f
+left join #mouse m on m.messageId = f.messageId
+left join #ctrlC_SelectText cs on cs.messageId = f.messageId
+left join #collapse as c on f.ActivityId = c.activityId and c.Date_expand_collapse between f.date_comment and f.leadMessage
+group by 
+f.ActivityId
+, f.date_activity
+, f.MessageID
+, f.date_comment
+, f.mark_message
+, f.datalen
+, f.datalengroup
+, f.OneDay
+, f.datecheck1
+, f.datecheck3
+, f.datecheck7
+, f.datecheck14
+, f.lagMark
+, f.uniq_offer_type
+, f.uniq_product
+, coalesce(m.cnt_mouse, 0) 
+, coalesce(cs.cnt_selectText, 0)
+, coalesce(cs.cnt_ctrlC, 0)
