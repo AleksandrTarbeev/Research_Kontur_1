@@ -1,0 +1,195 @@
+--===========================================================================================================================================================
+-- Шаг 1 - Делаю финальную аналитику по собраным данным из ADWH и ClickHouse
+--===========================================================================================================================================================
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.1 Делаю аналитику на уравне карточки 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Смотрю сколько процентов карточек из всей выборки имеют одно сообщение, а сколько несколько сообщений в одной карточке
+select 
+mark_message
+, count(distinct ActivityId) as cntAcID
+from [User].[a.tarbeev].[Final_metrics1]
+group by mark_message
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.2 Собираю статистику по продуктам в зависимости от длины комментария (датасеты обрабатываю в excel для подсчета статистики)
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Смотрю сколько карточек имеет уникальный продукт
+select
+case when uniq_product = '0' then '0' else '1' end uniq_product
+, count(distinct ActivityId) as cntAcID
+from [User].[a.tarbeev].[Final_metrics1]
+group by 
+case when uniq_product = '0' then '0' else '1' end
+
+-- Смотрю сколько процентов из всей выборкти приходится на карточки с определенным видом продукта
+select 
+uniq_product
+, count(distinct ActivityId) as cntAcID
+from [User].[a.tarbeev].[Final_metrics1]
+where uniq_product <> '0'
+group by 
+uniq_product
+order by count(distinct ActivityId) desc
+
+--Смотрю сколько процентов из всей выборкти приходится на карточки с определенным видом продукта в зависимости от длины комментария
+select 
+uniq_product
+,datalengroup
+, count(distinct ActivityId) as cntAcID
+from [User].[a.tarbeev].[Final_metrics1]
+where uniq_product <> '0'
+group by 
+uniq_product
+, datalengroup
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.3 Собираю статистику по типам офферов в зависимости от длины комментария (датасеты обрабатываю в excel для подсчета статистики)
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Смотрю сколько карточек имеет уникальный тип предложения
+select 
+uniq_offer_type
+, count(distinct ActivityId) as cntAcID
+from [User].[a.tarbeev].[Final_metrics1]
+group by 
+uniq_offer_type
+order by count(distinct ActivityId) desc
+
+--Смотрю сколько процентов из всей выборкти приходится на карточки с определенным типом предложения в зависимости от длины комментария
+select 
+uniq_offer_type
+,datalengroup
+, count(distinct ActivityId) as cntAcID
+from [User].[a.tarbeev].[Final_metrics1]
+where uniq_offer_type <> '0'
+group by 
+uniq_offer_type
+, datalengroup
+order by count(distinct ActivityId) desc
+
+
+-- Воронка и аналитика по карточке в рамках открытия и закрытия ленты сообщений
+select case when cnt_expand = '0' then '0' else '1' end cnt_expand
+, case when cnt_collapse = '0' then '0' else '1' end cnt_collapse
+, count(distinct ActivityId) as cnt_AcId 
+from [User].[a.tarbeev].[Final_metrics1]
+group by case when cnt_expand = '0' then '0' else '1' end 
+, case when cnt_collapse = '0' then '0' else '1' end
+order by cnt_expand
+, cnt_collapse
+
+--Гипотеза: повысится ли процент открывания комментария если он будет больше 2020 символов (проверяется потому, что окно комментариев в закрытом види дает прочитать не более 2020 символов без скрола)
+
+select 
+cnt_expand
+, count(distinct ActivityId) as cnt_AcId 
+from [User].[a.tarbeev].[Final_metrics1]
+where datalen > '2020'
+group by cnt_expand
+order by cnt_expand
+
+select 
+cnt_expand
+, count(distinct ActivityId) as cnt_AcId 
+from [User].[a.tarbeev].[Final_metrics1] 
+where datalen < '2020'
+group by cnt_expand
+order by cnt_expand
+
+-- Гипотеза: резворачивают ли чаще ленту комментариев, если в карточке больше одного комментария
+select 
+cnt_expand
+, count(distinct ActivityId) as cnt_AcId 
+from [User].[a.tarbeev].[Final_metrics1] 
+where mark_message = '0'
+group by cnt_expand
+order by cnt_expand
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.4 Делаю аналитику на уровне сообщения  (датасеты обрабатываю в excel для подсчета статистики)
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- По комментариям - Вывожу даные для когортного анализа по длине комментария с учетом подтянувшихся офферов в рамках гипотез по временным промежуткам, которые затрагивают определенное кол-во офферов 
+select
+datalengroup
+, count(MessageID) as cnt_MesID
+, sum(OneDay) as OneDay
+--, sum(datecheck1) as datecheck1
+--, sum(datecheck3) as datecheck3
+--, sum(datecheck7) as datecheck7
+--, sum(datecheck14) as datecheck14
+--, sum(lagMark) as lagMark
+from [User].[a.tarbeev].[Final_metrics1] 
+where OneDay <> '0'
+--where datecheck1 <> '0'
+--where datecheck3 <> '0'
+--where datecheck7 <> '0'
+--where datecheck14 <> '0'
+--where lagMark <> '0'
+group by
+datalengroup
+order by cast(datalengroup as int)
+
+-- Кол-во комментариев по когортам длин комментариев
+select 
+count(distinct MessageID) as MessageID
+, datalengroup
+from [User].[a.tarbeev].[Final_metrics1]
+group by datalengroup
+order by MessageID desc
+
+-- воронка и аналитика по метрикам из СН на уровне сообщений
+
+select 
+  iif(cnt_mouse=0,0,1) as cnt_mouse
+, iif(cnt_selectText=0,0,1) as cnt_selectText
+, iif(cnt_ctrlC=0,0,1) as cnt_ctrlC
+, count(MessageID) as cnt_MesID 
+from [User].[a.tarbeev].[Final_metrics1] 
+group by   iif(cnt_mouse=0,0,1)
+, iif(cnt_selectText=0,0,1)
+, iif(cnt_ctrlC=0,0,1) 
+order by   cnt_mouse
+, cnt_selectText
+, cnt_ctrlC
+
+
+--Гипотеза: Проводят ли чаще по коментарию мышкой если он большой 
+
+select 
+  cnt_mouse
+, datalengroup
+, count(distinct MessageID) as cnt_MesID
+from [User].[a.tarbeev].[Final_metrics1]  
+group by cnt_mouse
+, datalengroup
+order by cnt_mouse
+, datalengroup
+--далее смотрю тепловую карту в excel
+
+-- Смотрю среднее кол-во движений мышью внутри каждой из когорт по длине комментария
+
+with tab as (
+select 
+  cast (sum(cnt_mouse) as float) as cnt_mouse
+, datalengroup
+, cast (count(distinct MessageID) as float) as cnt_MesID
+from [User].[a.tarbeev].[Final_metrics1]  
+group by   
+ datalengroup
+)
+SELECT 
+datalengroup
+,cast (round (cnt_mouse / cnt_MesID, 2) as float) as avg_mouse
+from tab
+
+-- Средняя длина сообщения приходящегося на одно предложение в рамках сценария по лагу 
+
+select
+datalengroup
+, avg(round(datalen / nullif(cast(lagMark as float), 0), 1)) as simbol_offer
+from [User].[a.tarbeev].[Final_metrics1] 
+group by
+datalengroup
+order by avg(round(datalen / nullif(cast(lagMark as float), 0), 1))
